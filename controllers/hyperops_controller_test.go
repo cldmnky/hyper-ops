@@ -29,6 +29,7 @@ var _ = Describe("Hyper-Ops controller", func() {
 			hyperOpsControllerNameSpace string
 			namespace                   *corev1.Namespace
 			gitOpsNamespace             *corev1.Namespace
+			defaultGitOpsNamespace      *corev1.Namespace
 			hyperOpsReconciler          *HyperOpsReconciler
 			cluster                     *hypershiftv1beta1.HostedCluster
 		)
@@ -45,16 +46,31 @@ var _ = Describe("Hyper-Ops controller", func() {
 					Namespace: hyperOpsControllerNameSpace,
 				},
 			}
+			err := k8sClient.Create(ctx, namespace)
+			Expect(err).To(Not(HaveOccurred()))
 			gitOpsNamespace = &corev1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      fmt.Sprintf("openshift-gitops-%d", time.Now().UnixMilli()),
 					Namespace: fmt.Sprintf("openshift-gitops-%d", time.Now().UnixMilli()),
 				},
 			}
-			err := k8sClient.Create(ctx, namespace)
-			Expect(err).To(Not(HaveOccurred()))
 			err = k8sClient.Create(ctx, gitOpsNamespace)
 			Expect(err).To(Not(HaveOccurred()))
+			// create the openshift-gitops namespace if it does not exist
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "openshift-gitops", Namespace: "openshift-gitops"}, defaultGitOpsNamespace)
+			if err != nil {
+				defaultGitOpsNamespace = &corev1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "openshift-gitops",
+						Namespace: "openshift-gitops",
+					},
+				}
+				err = k8sClient.Create(ctx, defaultGitOpsNamespace)
+				Expect(err).To(Not(HaveOccurred()))
+			}
+
+			Expect(err).To(Not(HaveOccurred()))
+
 			By("Namespaces created")
 			Eventually(func() error {
 				return k8sClient.Get(ctx, types.NamespacedName{Name: hyperOpsControllerNameSpace, Namespace: hyperOpsControllerNameSpace}, namespace)
@@ -222,8 +238,28 @@ var _ = Describe("Hyper-Ops controller", func() {
 						return k8sClient.Get(ctx, types.NamespacedName{Name: hyperOpsControllerBaseName, Namespace: gitOpsNamespace.Name}, secret)
 					}, time.Second*10, time.Second*2).Should(Succeed())
 
-				})
+					By("Updating the labels on the HostedCluster")
+					cluster.Labels = map[string]string{
+						"hyper-ops.cloudmonkey.org/enabled":          "true",
+						"hyper-ops.cloudmonkey.org/gitops-namespace": gitOpsNamespace.Name,
+						"hyper-ops.cloudmonkey.org/cluster-name":     "test",
+					}
+					err = k8sClient.Update(ctx, cluster)
+					Expect(err).To(Not(HaveOccurred()))
 
+					By("Reconciling the hosted cluster resource created")
+					req = reconcile.Request{
+						NamespacedName: typeNamespaceName,
+					}
+					_, err = hyperOpsReconciler.Reconcile(ctx, req)
+					Expect(err).To(Not(HaveOccurred()))
+
+					By("Checking that the secret labels has been updated")
+					Eventually(func() error {
+						return k8sClient.Get(ctx, types.NamespacedName{Name: hyperOpsControllerBaseName, Namespace: gitOpsNamespace.Name}, secret)
+					}, time.Second*10, time.Second*2).Should(Succeed())
+					Expect(secret.Labels).To(HaveKeyWithValue("hyper-ops.cloudmonkey.org/cluster-name", "test"))
+				})
 			})
 		})
 	})

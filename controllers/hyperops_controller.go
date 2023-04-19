@@ -53,6 +53,12 @@ var (
 	gitOpsNamespace = "openshift-gitops"
 )
 
+type Cluster struct {
+	Name   string        `json:"name"`
+	Server string        `json:"server"`
+	Config ClusterConfig `json:"clusterConfig"`
+}
+
 type ClusterConfig struct {
 	BearerToken     string          `json:"bearerToken"`
 	TLSClientConfig TLSClientConfig `json:"tlsClientConfig"`
@@ -75,7 +81,7 @@ func (r *HyperOpsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	hc := &hypershiftv1beta1.HostedCluster{}
 	if err := r.Get(ctx, req.NamespacedName, hc); err != nil {
-		log.Error(err, "unable to fetch HostedCluster")
+		log.V(3).Error(err, "unable to fetch HostedCluster")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	// TODO: Handle deletion
@@ -92,67 +98,64 @@ func (r *HyperOpsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 		return ctrl.Result{}, nil
 	}
-	// skip if the hosted cluster sets the label to false
-	if enabled, ok := hc.GetLabels()[hyperOpsEnabledLabel]; ok && enabled == "false" {
-		log.Info("HostedCluster have the hyper-ops enabled label set to false")
-		return ctrl.Result{}, nil
-	}
 	// check if the hostedcluster has defined the gitops namespace
 	if _, ok := hc.GetLabels()[hyperOpsGitopsNamespaceLabel]; !ok {
-		log.Info("HostedCluster does not have the gitops namespace label, using default namespace: openshift-gitops")
+		log.V(3).Info("HostedCluster does not have the gitops namespace label, using default namespace: openshift-gitops")
 	} else {
 		gitOpsNamespace = hc.GetLabels()[hyperOpsGitopsNamespaceLabel]
+	}
+	// create the service account for the local cluster
+	localCluster, err := r.setupClusterConfig(ctx, r.Client, "https://kubernetes.default.svc", "in-cluster-local")
+	if err != nil {
+		log.V(3).Error(err, "unable to create in-cluster config")
+		return ctrl.Result{}, err
+	}
+
+	localClusterLabels := map[string]string{
+		"hyper-ops.cloudmonkey.org/type": "local",
+	}
+
+	if err := r.createArgoCDClusterSecret(ctx, localClusterLabels, localCluster); err != nil {
+		log.V(3).Error(err, "unable to create in-cluster argocd cluster secret")
+		return ctrl.Result{}, err
+	}
+
+	// skip if the hosted cluster sets the label to false
+	if enabled, ok := hc.GetLabels()[hyperOpsEnabledLabel]; ok && enabled == "false" {
+		log.V(3).Info("HostedCluster have the hyper-ops enabled label set to false")
+		return ctrl.Result{}, nil
 	}
 	// get the kubeconfig for the hosted cluster
 	kubeConfigSecret := &corev1.Secret{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: req.Namespace, Name: fmt.Sprintf("%s-admin-kubeconfig", req.Name)}, kubeConfigSecret); err != nil {
-		log.Error(err, "unable to fetch kubeconfig secret")
+		log.V(3).Error(err, "unable to fetch kubeconfig secret")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	hostedClusterClient, err := GetClientForCluster(kubeConfigSecret.Data["kubeconfig"])
 	if err != nil {
-		log.Error(err, "unable to create hosted cluster client")
-		return ctrl.Result{}, err
-	}
-	hostedClusterConfig, err := r.createHostedClusterConfig(ctx, hostedClusterClient)
-	if err != nil {
-		log.Error(err, "unable to create hosted cluster config")
+		log.V(3).Error(err, "unable to create hosted cluster client")
 		return ctrl.Result{}, err
 	}
 
-	jsonConfig, err := json.Marshal(hostedClusterConfig)
+	server, err := r.getServerFromKubeConfig(kubeConfigSecret)
 	if err != nil {
+		log.V(3).Error(err, "unable to get server from kubeconfig")
 		return ctrl.Result{}, err
 	}
-	kubeconfig := api.Config{}
 
-	if err := yaml.Unmarshal(kubeConfigSecret.Data["kubeconfig"], &kubeconfig); err != nil {
-		return ctrl.Result{}, err
-	}
-	argocdClusterLabels := hc.GetLabels()
-	argocdClusterLabels[argoCDSecretTypeLabel] = argoCDSecretTypeCluster
-	// create the cluster secret for argocd
-	argocdCluster := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      req.Name,
-			Namespace: gitOpsNamespace,
-			Labels:    argocdClusterLabels,
-		},
-		Data: map[string][]byte{
-			"name":   []byte(hc.Name),
-			"server": []byte(kubeconfig.Clusters[0].Cluster.Server),
-			"config": jsonConfig,
-		},
-		Type: corev1.SecretTypeOpaque,
-	}
-	op, err := CreateOrUpdateWithRetries(ctx, r.Client, argocdCluster, func() error {
-		return nil
-	})
+	hostedClusterConfig, err := r.setupClusterConfig(ctx, hostedClusterClient, server, hc.Name)
 	if err != nil {
-		log.Error(err, "unable to ensure argo cluster secret")
+		log.V(3).Error(err, "unable to create hosted cluster config")
 		return ctrl.Result{}, err
 	}
-	log.Info("argocd cluster secret", "op", op)
+
+	hostedClusterLabels := hc.GetLabels()
+	hostedClusterLabels["hyper-ops.cloudmonkey.org/type"] = "hosted"
+
+	if err := r.createArgoCDClusterSecret(ctx, hostedClusterLabels, hostedClusterConfig); err != nil {
+		log.V(3).Error(err, "unable to create argocd cluster secret")
+		return ctrl.Result{}, err
+	}
 	return ctrl.Result{}, nil
 }
 
@@ -181,8 +184,53 @@ func (r *HyperOpsReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-func (r *HyperOpsReconciler) createHostedClusterConfig(ctx context.Context, clnt client.Client) (*ClusterConfig, error) {
+func (r *HyperOpsReconciler) createArgoCDClusterSecret(ctx context.Context, ExtraLabels map[string]string, cluster *Cluster) error {
 	log := log.FromContext(ctx)
+	// create the secret for the local cluster
+	argocdClusterLabels := ExtraLabels
+	argocdClusterLabels[argoCDSecretTypeLabel] = argoCDSecretTypeCluster
+
+	jsonConfig, err := json.Marshal(cluster.Config)
+	if err != nil {
+		return err
+	}
+
+	argocdCluster := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cluster.Name,
+			Namespace: gitOpsNamespace,
+			Labels:    argocdClusterLabels,
+		},
+		Data: map[string][]byte{
+			"name":   []byte(cluster.Name),
+			"server": []byte(cluster.Server),
+			"config": jsonConfig,
+		},
+		Type: corev1.SecretTypeOpaque,
+	}
+	op, err := CreateOrUpdateWithRetries(ctx, r.Client, argocdCluster, func() error {
+		argocdCluster.Labels = argocdClusterLabels
+		return nil
+	})
+	if err != nil {
+		log.V(3).Error(err, "unable to ensure argo cluster secret")
+		return err
+	}
+	log.V(3).Info("argocd cluster secret", "op", op)
+	return nil
+}
+
+func (r *HyperOpsReconciler) getServerFromKubeConfig(kubeConfigSecret *corev1.Secret) (string, error) {
+	kubeconfig := api.Config{}
+	if err := yaml.Unmarshal(kubeConfigSecret.Data["kubeconfig"], &kubeconfig); err != nil {
+		return "", err
+	}
+	return kubeconfig.Clusters[0].Cluster.Server, nil
+}
+
+func (r *HyperOpsReconciler) setupClusterConfig(ctx context.Context, clnt client.Client, server string, name string) (*Cluster, error) {
+	log := log.FromContext(ctx)
+	log.Info("setting up cluster config", "name", name, "server", server)
 	sa := &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      hostedClusterServiceAccountName,
@@ -193,10 +241,10 @@ func (r *HyperOpsReconciler) createHostedClusterConfig(ctx context.Context, clnt
 		return nil
 	})
 	if err != nil {
-		log.Error(err, "unable to ensure hosted cluster service account")
+		log.V(3).Error(err, "unable to ensure hosted cluster service account")
 		return nil, err
 	}
-	log.Info("service account created", "op", op)
+	log.V(3).Info("service account created", "op", op)
 	// create a cluster role binding
 	crb := &rbacv1.ClusterRoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
@@ -219,10 +267,10 @@ func (r *HyperOpsReconciler) createHostedClusterConfig(ctx context.Context, clnt
 		return nil
 	})
 	if err != nil {
-		log.Error(err, "unable to ensure hosted cluster cluster role binding")
+		log.V(3).Error(err, "unable to ensure hosted cluster cluster role binding")
 		return nil, err
 	}
-	log.Info("cluster role binding created", "op", op)
+	log.V(3).Info("cluster role binding created", "op", op)
 
 	// Create an sa token secret
 	saTokenSecret := &corev1.Secret{
@@ -239,14 +287,14 @@ func (r *HyperOpsReconciler) createHostedClusterConfig(ctx context.Context, clnt
 		return nil
 	})
 	if err != nil {
-		log.Error(err, "unable to ensure hosted cluster service account token")
+		log.V(3).Error(err, "unable to ensure hosted cluster service account token")
 		return nil, err
 	}
-	log.Info("service account token created", "op", op)
+	log.V(3).Info("service account token created", "op", op)
 
 	// Get the token secret
 	if err := clnt.Get(ctx, client.ObjectKey{Namespace: "kube-system", Name: "hyper-ops-admin-token"}, saTokenSecret); err != nil {
-		log.Error(err, "unable to get hosted cluster secret")
+		log.V(3).Error(err, "unable to get hosted cluster secret")
 		return nil, err
 	}
 	if len(saTokenSecret.Data["token"]) == 0 {
@@ -256,10 +304,14 @@ func (r *HyperOpsReconciler) createHostedClusterConfig(ctx context.Context, clnt
 		return nil, fmt.Errorf("ca.crt not found")
 	}
 	// create the cluster config
-	return &ClusterConfig{
-		BearerToken: string(saTokenSecret.Data["token"]),
-		TLSClientConfig: TLSClientConfig{
-			CAData: base64.URLEncoding.EncodeToString(saTokenSecret.Data["ca.crt"]),
+	return &Cluster{
+		Name:   name,
+		Server: server,
+		Config: ClusterConfig{
+			BearerToken: string(saTokenSecret.Data["token"]),
+			TLSClientConfig: TLSClientConfig{
+				CAData: base64.URLEncoding.EncodeToString(saTokenSecret.Data["ca.crt"]),
+			},
 		},
 	}, nil
 }
