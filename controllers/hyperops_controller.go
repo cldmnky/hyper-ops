@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"gopkg.in/yaml.v2"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -39,8 +40,7 @@ import (
 )
 
 const (
-	hyperOpsEnabledLabel         = "hyper-ops.cloudmonkey.org/enabled"
-	hyperOpsGitopsNamespaceLabel = "hyper-ops.cloudmonkey.org/gitops-namespace"
+	hyperOpsLabel = "hyper-ops.cloudmonkey.org"
 
 	argoCDSecretTypeLabel   = "argocd.argoproj.io/secret-type"
 	argoCDSecretTypeCluster = "cluster"
@@ -50,13 +50,16 @@ const (
 )
 
 var (
-	gitOpsNamespace = "openshift-gitops"
+	hyperOpsEnabledLabel         = fmt.Sprintf("%s/enabled", hyperOpsLabel)
+	hyperOpsGitopsNamespaceLabel = fmt.Sprintf("%s/gitops-namespace", hyperOpsLabel)
+	gitOpsNamespace              = "openshift-gitops"
 )
 
 type Cluster struct {
-	Name   string        `json:"name"`
-	Server string        `json:"server"`
-	Config ClusterConfig `json:"clusterConfig"`
+	Name          string        `json:"name"`
+	Server        string        `json:"server"`
+	Config        ClusterConfig `json:"clusterConfig"`
+	HostedCluster *hypershiftv1beta1.HostedCluster
 }
 
 type ClusterConfig struct {
@@ -73,9 +76,9 @@ type HyperOpsReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-//+kubebuilder:rbac:groups=hypershift.openshift.io,resources=hostedclusters,verbs=get;list;watch
-//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
-
+// +kubebuilder:rbac:groups=hypershift.openshift.io,resources=hostedclusters,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 func (r *HyperOpsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
@@ -105,7 +108,7 @@ func (r *HyperOpsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		gitOpsNamespace = hc.GetLabels()[hyperOpsGitopsNamespaceLabel]
 	}
 	// create the service account for the local cluster
-	localCluster, err := r.setupClusterConfig(ctx, r.Client, "https://kubernetes.default.svc", "in-cluster-local")
+	localCluster, err := r.setupClusterConfig(ctx, r.Client, "https://kubernetes.default.svc", "in-cluster-local", nil)
 	if err != nil {
 		log.V(3).Error(err, "unable to create in-cluster config")
 		return ctrl.Result{}, err
@@ -143,13 +146,19 @@ func (r *HyperOpsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
-	hostedClusterConfig, err := r.setupClusterConfig(ctx, hostedClusterClient, server, hc.Name)
+	hostedClusterConfig, err := r.setupClusterConfig(ctx, hostedClusterClient, server, hc.Name, hc)
 	if err != nil {
 		log.V(3).Error(err, "unable to create hosted cluster config")
 		return ctrl.Result{}, err
 	}
 
 	hostedClusterLabels := hc.GetLabels()
+	// only keep the labels that are related to hyper-ops
+	for k := range hostedClusterLabels {
+		if !strings.HasPrefix(k, hyperOpsLabel) {
+			delete(hostedClusterLabels, k)
+		}
+	}
 	hostedClusterLabels["hyper-ops.cloudmonkey.org/type"] = "hosted"
 
 	if err := r.createArgoCDClusterSecret(ctx, hostedClusterLabels, hostedClusterConfig); err != nil {
@@ -184,10 +193,10 @@ func (r *HyperOpsReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-func (r *HyperOpsReconciler) createArgoCDClusterSecret(ctx context.Context, ExtraLabels map[string]string, cluster *Cluster) error {
+func (r *HyperOpsReconciler) createArgoCDClusterSecret(ctx context.Context, labels map[string]string, cluster *Cluster) error {
 	log := log.FromContext(ctx)
 	// create the secret for the local cluster
-	argocdClusterLabels := ExtraLabels
+	argocdClusterLabels := labels
 	argocdClusterLabels[argoCDSecretTypeLabel] = argoCDSecretTypeCluster
 
 	jsonConfig, err := json.Marshal(cluster.Config)
@@ -199,17 +208,16 @@ func (r *HyperOpsReconciler) createArgoCDClusterSecret(ctx context.Context, Extr
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cluster.Name,
 			Namespace: gitOpsNamespace,
-			Labels:    argocdClusterLabels,
 		},
-		Data: map[string][]byte{
-			"name":   []byte(cluster.Name),
-			"server": []byte(cluster.Server),
-			"config": jsonConfig,
-		},
-		Type: corev1.SecretTypeOpaque,
 	}
 	op, err := CreateOrUpdateWithRetries(ctx, r.Client, argocdCluster, func() error {
 		argocdCluster.Labels = argocdClusterLabels
+		argocdCluster.Data = map[string][]byte{
+			"name":   []byte(cluster.Name),
+			"server": []byte(cluster.Server),
+			"config": jsonConfig,
+		}
+		argocdCluster.Type = corev1.SecretTypeOpaque
 		return nil
 	})
 	if err != nil {
@@ -228,7 +236,7 @@ func (r *HyperOpsReconciler) getServerFromKubeConfig(kubeConfigSecret *corev1.Se
 	return kubeconfig.Clusters[0].Cluster.Server, nil
 }
 
-func (r *HyperOpsReconciler) setupClusterConfig(ctx context.Context, clnt client.Client, server string, name string) (*Cluster, error) {
+func (r *HyperOpsReconciler) setupClusterConfig(ctx context.Context, clnt client.Client, server string, name string, hc *hypershiftv1beta1.HostedCluster) (*Cluster, error) {
 	log := log.FromContext(ctx)
 	log.Info("setting up cluster config", "name", name, "server", server)
 	sa := &corev1.ServiceAccount{
@@ -313,5 +321,6 @@ func (r *HyperOpsReconciler) setupClusterConfig(ctx context.Context, clnt client
 				CAData: base64.URLEncoding.EncodeToString(saTokenSecret.Data["ca.crt"]),
 			},
 		},
+		HostedCluster: hc,
 	}, nil
 }
