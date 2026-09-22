@@ -51,7 +51,9 @@ const (
 	hyperOpsLabelPrefix = "hyper-ops.cloudmonkey.org"
 
 	// hyperOpsEnabledLabel is set by users to "false" to opt a HostedCluster out.
-	// The label is absent by default, which means hyper-ops is enabled.
+	// The label is absent by default, which means hyper-ops is enabled: only the
+	// explicit value "false" disables a HostedCluster. Deletion is never skipped
+	// by this label, the finalizer based cleanup always runs.
 	hyperOpsEnabledLabel = hyperOpsLabelPrefix + "/enabled"
 	// hyperOpsGitopsNamespaceLabel holds the namespace the ArgoCD cluster secrets
 	// are written to. It defaults to defaultGitOpsNamespace when not set.
@@ -166,6 +168,8 @@ func (r *HyperOpsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// The GitOps namespace is derived from the HostedCluster on every reconcile
 	// and passed around explicitly. It is never stored in package state, which
 	// would leak between HostedClusters and between concurrent reconciles.
+	// Changing the label therefore moves the secrets on the next reconcile and
+	// orphans the ones in the previous namespace, see gitOpsNamespaceFor.
 	gitOpsNamespace := gitOpsNamespaceFor(hc)
 
 	if !hc.DeletionTimestamp.IsZero() {
@@ -173,9 +177,9 @@ func (r *HyperOpsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	// Skip all work, including the finalizer and any provisioning side effect,
-	// when the HostedCluster explicitly opts out.
-	if enabled, ok := hc.GetLabels()[hyperOpsEnabledLabel]; ok && enabled == "false" {
-		logger.Info("hyper-ops is disabled for HostedCluster, nothing to do", "hostedcluster", req.NamespacedName)
+	// when the HostedCluster explicitly opts out. An absent label means enabled.
+	if !isHyperOpsEnabled(hc) {
+		logger.Info("hyper-ops is explicitly disabled for HostedCluster, nothing to do", "hostedcluster", req.NamespacedName)
 		return ctrl.Result{}, nil
 	}
 
@@ -222,7 +226,8 @@ func (r *HyperOpsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	server, err := r.getServerFromKubeConfig(kubeConfigSecret)
 	if err != nil {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("getting server from admin kubeconfig secret %s for HostedCluster %s: %w",
+			kubeConfigSecretKey, req.NamespacedName, err)
 	}
 
 	hostedClusterConfig, err := r.setupClusterConfig(ctx, hostedClusterClient, server, hc.Name)
@@ -269,28 +274,63 @@ func (r *HyperOpsReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// hyperOpsHostedClusterPredicate filters HostedCluster events: only HostedClusters
-// that select hyper-ops with the enabled label are reconciled.
+// hyperOpsHostedClusterPredicate filters HostedCluster events. The enabled label
+// is opt-out: hyper-ops is enabled unless the label is explicitly "false", so an
+// absent label must never filter an event out.
+//
+// Deletion is never filtered either: the finalizer based cleanup only runs when
+// the terminating HostedCluster is reconciled, so a terminating object and an
+// object that still carries the hyper-ops finalizer always pass, regardless of
+// their labels.
 func hyperOpsHostedClusterPredicate() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
-			return hasHyperOpsEnabledLabel(e.Object)
+			return isHyperOpsEnabled(e.Object)
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			return hasHyperOpsEnabledLabel(e.ObjectNew)
+			// A terminating HostedCluster must always be reconciled: this is
+			// the event that triggers the cleanup removing the finalizer.
+			if isTerminating(e.ObjectNew) {
+				return true
+			}
+			// Let label changes through when the HostedCluster was enabled
+			// before, or still carries the finalizer, so that opting out or
+			// dropping the label can never skip the cleanup of existing
+			// resources.
+			if isHyperOpsEnabled(e.ObjectOld) || hasHyperOpsFinalizer(e.ObjectNew) {
+				return true
+			}
+			return isHyperOpsEnabled(e.ObjectNew)
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
-			return hasHyperOpsEnabledLabel(e.Object)
+			return isTerminating(e.Object) || hasHyperOpsFinalizer(e.Object) || isHyperOpsEnabled(e.Object)
+		},
+		GenericFunc: func(e event.GenericEvent) bool {
+			return isTerminating(e.Object) || hasHyperOpsFinalizer(e.Object) || isHyperOpsEnabled(e.Object)
 		},
 	}
 }
 
-func hasHyperOpsEnabledLabel(obj client.Object) bool {
+// isHyperOpsEnabled reports whether hyper-ops should manage the object. The
+// enabled label is opt-out: only the explicit value "false" disables a
+// HostedCluster, any other value (including an absent label) enables it.
+func isHyperOpsEnabled(obj client.Object) bool {
 	if obj == nil {
 		return false
 	}
-	_, ok := obj.GetLabels()[hyperOpsEnabledLabel]
-	return ok
+	return obj.GetLabels()[hyperOpsEnabledLabel] != "false"
+}
+
+// isTerminating reports whether the object was deleted and is waiting for its
+// finalizers to be removed.
+func isTerminating(obj client.Object) bool {
+	return obj != nil && !obj.GetDeletionTimestamp().IsZero()
+}
+
+// hasHyperOpsFinalizer reports whether the object still carries the hyper-ops
+// finalizer.
+func hasHyperOpsFinalizer(obj client.Object) bool {
+	return obj != nil && controllerutil.ContainsFinalizer(obj, hyperOpsFinalizer)
 }
 
 // mapAdminKubeconfigSecret enqueues the HostedCluster an admin kubeconfig secret
@@ -322,6 +362,10 @@ func (r *HyperOpsReconciler) reconcileDelete(
 	logger.Info("cleaning up hyper-ops resources for terminating HostedCluster",
 		"hostedcluster", key, "gitopsNamespace", gitOpsNamespace)
 
+	// Cleanup only looks at the namespace currently selected by the label: a
+	// gitops-namespace change after the secrets were created leaves the secret in
+	// the previous namespace behind (see gitOpsNamespaceFor).
+
 	// The ArgoCD cluster secret of the HostedCluster is named after it; only
 	// secrets that carry hyper-ops labels are removed.
 	hostedSecretKey := client.ObjectKey{Namespace: gitOpsNamespace, Name: hc.Name}
@@ -336,11 +380,16 @@ func (r *HyperOpsReconciler) reconcileDelete(
 		return ctrl.Result{}, fmt.Errorf("deleting in-cluster argocd cluster secret %s for HostedCluster %s: %w", localSecretKey, key, err)
 	}
 
-	// Remove the finalizer on a deep copy so the cached object handed to Reconcile
-	// is never mutated in place.
-	patch := client.MergeFrom(hc.DeepCopy())
-	controllerutil.RemoveFinalizer(hc, hyperOpsFinalizer)
-	if err := r.Patch(ctx, hc, patch); err != nil {
+	// Remove the finalizer on a copy: the object handed to Reconcile is never
+	// mutated in place. The patch uses an optimistic lock, so it fails with a
+	// conflict instead of silently overwriting a HostedCluster that changed since
+	// it was read (for example because another finalizer was added). The conflict
+	// is returned to the caller, which requeues the HostedCluster and retries
+	// with a freshly read object.
+	updated := hc.DeepCopy()
+	controllerutil.RemoveFinalizer(updated, hyperOpsFinalizer)
+	patch := client.MergeFromWithOptions(hc.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	if err := r.Patch(ctx, updated, patch); err != nil {
 		return ctrl.Result{}, fmt.Errorf("removing finalizer from HostedCluster %s: %w", key, err)
 	}
 	logger.Info("removed hyper-ops finalizer", "hostedcluster", key)
@@ -348,13 +397,20 @@ func (r *HyperOpsReconciler) reconcileDelete(
 }
 
 // ensureFinalizer adds the hyper-ops finalizer to the HostedCluster if needed.
+//
+// The patch uses an optimistic lock on the resourceVersion so a concurrent
+// writer (another controller, or a second worker reconciling the same
+// HostedCluster) is never overwritten with a stale finalizer list. A conflict is
+// returned to the caller, which requeues the HostedCluster and retries with a
+// freshly read object.
 func (r *HyperOpsReconciler) ensureFinalizer(ctx context.Context, hc *hypershiftv1beta1.HostedCluster) error {
 	if controllerutil.ContainsFinalizer(hc, hyperOpsFinalizer) {
 		return nil
 	}
-	patch := client.MergeFrom(hc.DeepCopy())
-	controllerutil.AddFinalizer(hc, hyperOpsFinalizer)
-	if err := r.Patch(ctx, hc, patch); err != nil {
+	updated := hc.DeepCopy()
+	controllerutil.AddFinalizer(updated, hyperOpsFinalizer)
+	patch := client.MergeFromWithOptions(hc.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	if err := r.Patch(ctx, updated, patch); err != nil {
 		return fmt.Errorf("adding finalizer to HostedCluster %s: %w", client.ObjectKeyFromObject(hc), err)
 	}
 	return nil
@@ -494,6 +550,12 @@ func (r *HyperOpsReconciler) getServerFromKubeConfig(kubeConfigSecret *corev1.Se
 // defaultGitOpsNamespace. The namespace is resolved for every reconcile, so
 // concurrent reconciles of different HostedClusters cannot leak a namespace into
 // each other.
+//
+// Known limitation: changing the gitops-namespace label after secrets were
+// created orphans the secret in the previous namespace. The previous namespace is
+// not recorded anywhere, so that secret is neither moved nor deleted. Set the
+// label back to the previous namespace before deleting the HostedCluster to let
+// the finalizer based cleanup remove it.
 func gitOpsNamespaceFor(hc *hypershiftv1beta1.HostedCluster) string {
 	if namespace := strings.TrimSpace(hc.GetLabels()[hyperOpsGitopsNamespaceLabel]); namespace != "" {
 		return namespace

@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -39,8 +40,12 @@ const (
 	// are copied to the ArgoCD cluster secret.
 	clusterNameLabel = hyperOpsLabelPrefix + "/cluster-name"
 
-	// enabledLabelValue is the value that opts a HostedCluster in.
+	// enabledLabelValue is a value that leaves a HostedCluster enrolled: the
+	// enabled label is opt-out and only "false" disables a HostedCluster.
 	enabledLabelValue = "true"
+
+	// disabledLabelValue is the value that opts a HostedCluster out.
+	disabledLabelValue = "false"
 
 	// Names of the helper secrets used by the getServerFromKubeConfig specs.
 	testKubeconfigSecretName      = "kubeconfig"
@@ -153,21 +158,109 @@ var _ = Describe("Hyper-Ops controller", func() {
 		})
 
 		Describe("HostedCluster event predicate", func() {
-			It("only reconciles HostedClusters with the hyper-ops enabled label", func() {
+			It("treats an absent enabled label as enabled", func() {
 				predicate := hyperOpsHostedClusterPredicate()
 				unlabeled := &hypershiftv1beta1.HostedCluster{ObjectMeta: metav1.ObjectMeta{Name: "unlabeled"}}
-				labeled := &hypershiftv1beta1.HostedCluster{ObjectMeta: metav1.ObjectMeta{
-					Name:   "labeled",
-					Labels: map[string]string{hyperOpsEnabledLabel: enabledLabelValue},
+
+				Expect(predicate.Create(event.CreateEvent{Object: unlabeled})).To(BeTrue())
+				Expect(predicate.Update(event.UpdateEvent{ObjectOld: unlabeled, ObjectNew: unlabeled})).To(BeTrue())
+				Expect(predicate.Delete(event.DeleteEvent{Object: unlabeled})).To(BeTrue())
+				Expect(predicate.Generic(event.GenericEvent{Object: unlabeled})).To(BeTrue())
+			})
+
+			It("filters HostedClusters that explicitly opt out", func() {
+				predicate := hyperOpsHostedClusterPredicate()
+				disabled := &hypershiftv1beta1.HostedCluster{ObjectMeta: metav1.ObjectMeta{
+					Name:   "disabled",
+					Labels: map[string]string{hyperOpsEnabledLabel: disabledLabelValue},
 				}}
 
-				Expect(predicate.Create(event.CreateEvent{Object: unlabeled})).To(BeFalse())
-				Expect(predicate.Update(event.UpdateEvent{ObjectOld: unlabeled, ObjectNew: unlabeled})).To(BeFalse())
-				Expect(predicate.Delete(event.DeleteEvent{Object: unlabeled})).To(BeFalse())
+				Expect(predicate.Create(event.CreateEvent{Object: disabled})).To(BeFalse())
+				Expect(predicate.Update(event.UpdateEvent{ObjectOld: disabled, ObjectNew: disabled})).To(BeFalse())
+				Expect(predicate.Delete(event.DeleteEvent{Object: disabled})).To(BeFalse())
+				Expect(predicate.Generic(event.GenericEvent{Object: disabled})).To(BeFalse())
+			})
 
-				Expect(predicate.Create(event.CreateEvent{Object: labeled})).To(BeTrue())
-				Expect(predicate.Update(event.UpdateEvent{ObjectOld: unlabeled, ObjectNew: labeled})).To(BeTrue())
-				Expect(predicate.Delete(event.DeleteEvent{Object: labeled})).To(BeTrue())
+			It("lets label transitions through in both directions", func() {
+				predicate := hyperOpsHostedClusterPredicate()
+				enrolled := &hypershiftv1beta1.HostedCluster{ObjectMeta: metav1.ObjectMeta{
+					Name:   "transitioning",
+					Labels: map[string]string{hyperOpsEnabledLabel: enabledLabelValue},
+				}}
+				optedOut := &hypershiftv1beta1.HostedCluster{ObjectMeta: metav1.ObjectMeta{
+					Name:   "opted-out",
+					Labels: map[string]string{hyperOpsEnabledLabel: disabledLabelValue},
+				}}
+
+				// Enrolling and opting out must both be reconciled: the
+				// predicate must not hide the transition, the reconciler decides
+				// what to do with it.
+				Expect(predicate.Update(event.UpdateEvent{ObjectOld: optedOut, ObjectNew: enrolled})).To(BeTrue())
+				Expect(predicate.Update(event.UpdateEvent{ObjectOld: enrolled, ObjectNew: optedOut})).To(BeTrue())
+			})
+
+			It("always lets terminating HostedClusters through, even when they opted out", func() {
+				predicate := hyperOpsHostedClusterPredicate()
+				now := metav1.Now()
+				terminating := &hypershiftv1beta1.HostedCluster{ObjectMeta: metav1.ObjectMeta{
+					Name:              "terminating",
+					DeletionTimestamp: &now,
+					Labels:            map[string]string{hyperOpsEnabledLabel: disabledLabelValue},
+				}}
+
+				// This is the regression for the deletion wedge: the update that sets
+				// the deletion timestamp must reach the reconciler so that the
+				// finalizer based cleanup runs.
+				Expect(predicate.Update(event.UpdateEvent{ObjectOld: terminating, ObjectNew: terminating})).To(BeTrue())
+				Expect(predicate.Delete(event.DeleteEvent{Object: terminating})).To(BeTrue())
+				Expect(predicate.Generic(event.GenericEvent{Object: terminating})).To(BeTrue())
+			})
+
+			It("lets HostedClusters carrying the finalizer through, even when they opted out", func() {
+				predicate := hyperOpsHostedClusterPredicate()
+				finalized := &hypershiftv1beta1.HostedCluster{ObjectMeta: metav1.ObjectMeta{
+					Name:       "finalized",
+					Finalizers: []string{hyperOpsFinalizer},
+					Labels:     map[string]string{hyperOpsEnabledLabel: disabledLabelValue},
+				}}
+
+				Expect(predicate.Update(event.UpdateEvent{ObjectOld: finalized, ObjectNew: finalized})).To(BeTrue())
+				Expect(predicate.Delete(event.DeleteEvent{Object: finalized})).To(BeTrue())
+				Expect(predicate.Generic(event.GenericEvent{Object: finalized})).To(BeTrue())
+			})
+
+			It("lets updates through when the enabled label was removed", func() {
+				predicate := hyperOpsHostedClusterPredicate()
+				enrolled := &hypershiftv1beta1.HostedCluster{ObjectMeta: metav1.ObjectMeta{
+					Name:   "enrolled",
+					Labels: map[string]string{hyperOpsEnabledLabel: enabledLabelValue},
+				}}
+				unlabeled := &hypershiftv1beta1.HostedCluster{ObjectMeta: metav1.ObjectMeta{Name: "enrolled"}}
+
+				Expect(predicate.Update(event.UpdateEvent{ObjectOld: enrolled, ObjectNew: unlabeled})).To(BeTrue())
+			})
+		})
+
+		Describe("Finalizer updates", func() {
+			It("rejects a stale finalizer patch with a conflict", func() {
+				By("Reading the HostedCluster")
+				stale := &hypershiftv1beta1.HostedCluster{}
+				Expect(k8sClient.Get(ctx, typeNamespaceName, stale)).To(Succeed())
+
+				By("Bumping the resourceVersion of the HostedCluster")
+				current := &hypershiftv1beta1.HostedCluster{}
+				Expect(k8sClient.Get(ctx, typeNamespaceName, current)).To(Succeed())
+				current.Labels = map[string]string{clusterNameLabel: "stale-check"}
+				Expect(k8sClient.Update(ctx, current)).To(Succeed())
+
+				By("Patching the finalizer on the stale copy")
+				err := hyperOpsReconciler.ensureFinalizer(ctx, stale)
+				Expect(err).To(HaveOccurred())
+				Expect(apierrors.IsConflict(err)).To(BeTrue())
+
+				By("Checking that the stale patch did not add the finalizer")
+				Expect(k8sClient.Get(ctx, typeNamespaceName, current)).To(Succeed())
+				Expect(controllerutil.ContainsFinalizer(current, hyperOpsFinalizer)).To(BeFalse())
 			})
 		})
 
@@ -236,7 +329,7 @@ var _ = Describe("Hyper-Ops controller", func() {
 				By("Opting the HostedCluster out")
 				Expect(k8sClient.Get(ctx, typeNamespaceName, cluster)).To(Succeed())
 				cluster.Labels = map[string]string{
-					hyperOpsEnabledLabel:         "false",
+					hyperOpsEnabledLabel:         disabledLabelValue,
 					hyperOpsGitopsNamespaceLabel: gitOpsNamespace.Name,
 				}
 				Expect(k8sClient.Update(ctx, cluster)).To(Succeed())
@@ -252,6 +345,30 @@ var _ = Describe("Hyper-Ops controller", func() {
 				}
 				Expect(k8sClient.Get(ctx, typeNamespaceName, cluster)).To(Succeed())
 				Expect(controllerutil.ContainsFinalizer(cluster, hyperOpsFinalizer)).To(BeFalse())
+			})
+		})
+
+		Describe("Without the enabled label", func() {
+			It("reconciles the HostedCluster because the label is opt-out", func() {
+				By("Setting only the GitOps namespace label")
+				Expect(k8sClient.Get(ctx, typeNamespaceName, cluster)).To(Succeed())
+				cluster.Labels = map[string]string{
+					hyperOpsGitopsNamespaceLabel: gitOpsNamespace.Name,
+				}
+				Expect(k8sClient.Update(ctx, cluster)).To(Succeed())
+
+				By("Reconciling the HostedCluster")
+				_, err := hyperOpsReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespaceName})
+				Expect(err).NotTo(HaveOccurred())
+
+				By("Checking the ArgoCD cluster secrets and the finalizer were created")
+				for _, name := range []string{localClusterName, hyperOpsControllerBaseName} {
+					Expect(k8sClient.Get(ctx, types.NamespacedName{
+						Name: name, Namespace: gitOpsNamespace.Name,
+					}, &corev1.Secret{})).To(Succeed(), "secret %s should exist", name)
+				}
+				Expect(k8sClient.Get(ctx, typeNamespaceName, cluster)).To(Succeed())
+				Expect(controllerutil.ContainsFinalizer(cluster, hyperOpsFinalizer)).To(BeTrue())
 			})
 		})
 
@@ -388,9 +505,14 @@ var _ = Describe("Hyper-Ops controller", func() {
 				Expect(k8sClient.Update(ctx, cluster)).To(Succeed())
 
 				By("Creating the Manager")
+				skipNameValidation := true
 				cm, err := manager.New(cfg, manager.Options{
 					Metrics:                metricsserver.Options{BindAddress: "0"},
 					HealthProbeBindAddress: "0",
+					// This suite creates more than one manager in the same
+					// process and the controller name registry is process wide,
+					// so the uniqueness validation is skipped here.
+					Controller: config.Controller{SkipNameValidation: &skipNameValidation},
 				})
 				Expect(err).NotTo(HaveOccurred())
 				Expect(hyperOpsReconciler.SetupWithManager(cm)).To(Succeed())
@@ -411,6 +533,65 @@ var _ = Describe("Hyper-Ops controller", func() {
 					}, hostedSecret)
 				}, 30*time.Second, time.Second).Should(Succeed())
 				Expect(hostedSecret.Labels).To(HaveKeyWithValue(hyperOpsTypeLabel, hyperOpsTypeHosted))
+
+				cancel()
+			})
+
+			It("removes the finalizer after the enabled label was removed and the HostedCluster deleted", func() {
+				By("Labeling the HostedCluster")
+				Expect(k8sClient.Get(ctx, typeNamespaceName, cluster)).To(Succeed())
+				cluster.Labels = map[string]string{
+					hyperOpsEnabledLabel:         enabledLabelValue,
+					hyperOpsGitopsNamespaceLabel: gitOpsNamespace.Name,
+				}
+				Expect(k8sClient.Update(ctx, cluster)).To(Succeed())
+
+				By("Creating the Manager")
+				skipNameValidation := true
+				cm, err := manager.New(cfg, manager.Options{
+					Metrics:                metricsserver.Options{BindAddress: "0"},
+					HealthProbeBindAddress: "0",
+					// See the note in the previous spec: the controller name
+					// registry is process wide and this suite starts several
+					// managers.
+					Controller: config.Controller{SkipNameValidation: &skipNameValidation},
+				})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(hyperOpsReconciler.SetupWithManager(cm)).To(Succeed())
+
+				By("Starting the Manager")
+				mgrCtx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				go func() {
+					defer GinkgoRecover()
+					Expect(cm.Start(mgrCtx)).NotTo(HaveOccurred())
+				}()
+
+				By("Waiting for the finalizer added by the watch")
+				Eventually(func() bool {
+					hc := &hypershiftv1beta1.HostedCluster{}
+					if err := k8sClient.Get(ctx, typeNamespaceName, hc); err != nil {
+						return false
+					}
+					return controllerutil.ContainsFinalizer(hc, hyperOpsFinalizer)
+				}, 30*time.Second, time.Second).Should(BeTrue())
+
+				// Removing the label before the deletion is the regression for the
+				// deletion wedge: the delete event must still reach the reconciler,
+				// otherwise the finalizer would keep the HostedCluster forever.
+				By("Removing the enabled label")
+				hc := &hypershiftv1beta1.HostedCluster{}
+				Expect(k8sClient.Get(ctx, typeNamespaceName, hc)).To(Succeed())
+				delete(hc.Labels, hyperOpsEnabledLabel)
+				Expect(k8sClient.Update(ctx, hc)).To(Succeed())
+
+				By("Deleting the HostedCluster")
+				Expect(k8sClient.Delete(ctx, hc)).To(Succeed())
+
+				By("Checking the finalizer based cleanup removed the HostedCluster")
+				Eventually(func() bool {
+					return apierrors.IsNotFound(k8sClient.Get(ctx, typeNamespaceName, &hypershiftv1beta1.HostedCluster{}))
+				}, 30*time.Second, time.Second).Should(BeTrue())
 
 				cancel()
 			})
