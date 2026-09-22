@@ -1,0 +1,175 @@
+# Release workflow.
+#
+# Builds and pushes multi-arch (linux/amd64, linux/arm64) operator, bundle
+# and catalog images to Quay.
+#
+# Trigger:
+#   - Publish a GitHub Release (tag like v0.0.8), or
+#   - Run manually from the Actions tab (workflow_dispatch).
+#
+# Required repository secrets:
+#   - QUAY_USERNAME
+#   - QUAY_TOKEN
+#
+# Produced artifacts (example for release tag v0.0.8):
+#   - quay.io/cldmnky/hyper-ops:v0.0.8
+#   - quay.io/cldmnky/hyper-ops-bundle:v0.0.8
+#   - quay.io/cldmnky/hyper-ops-catalog:<catalog_version> (default v1.0.1)
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Operator/bundle version, with or without leading v (e.g. 0.0.8)"
+        required: true
+        type: string
+      catalog_version:
+        description: "Catalog image tag (e.g. v1.0.1)"
+        required: false
+        default: "v1.0.1"
+        type: string
+      from_index:
+        description: "Existing catalog image to build on top of (empty for a fresh catalog)"
+        required: false
+        default: "quay.io/cldmnky/hyper-ops-catalog:v1.0"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_TAG_BASE: quay.io/cldmnky/hyper-ops
+  # Keep in sync with OPERATOR_SDK_VERSION in the Makefile.
+  OPERATOR_SDK_VERSION: v1.42.3
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  release:
+    name: Build and push to Quay
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check Quay credentials are configured
+        run: |
+          if [ -z "${{ secrets.QUAY_USERNAME }}" ] || [ -z "${{ secrets.QUAY_TOKEN }}" ]; then
+            echo "::error::Repository secrets QUAY_USERNAME and QUAY_TOKEN must be set."
+            exit 1
+          fi
+
+      - name: Resolve versions
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+            VERSION="${TAG#v}"
+            CATALOG_VERSION="v1.0.1"
+            FROM_INDEX="quay.io/cldmnky/hyper-ops-catalog:v1.0"
+          else
+            VERSION="${{ inputs.version }}"
+            VERSION="${VERSION#v}"
+            CATALOG_VERSION="${{ inputs.catalog_version }}"
+            FROM_INDEX="${{ inputs.from_index }}"
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid version '$VERSION'. Expected semver like 0.0.8."
+            exit 1
+          fi
+          {
+            echo "version=$VERSION"
+            echo "img=${{ env.IMAGE_TAG_BASE }}:v$VERSION"
+            echo "bundle_img=${{ env.IMAGE_TAG_BASE }}-bundle:v$VERSION"
+            echo "catalog_version=$CATALOG_VERSION"
+            echo "catalog_img=${{ env.IMAGE_TAG_BASE }}-catalog:$CATALOG_VERSION"
+            echo "from_index=$FROM_INDEX"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Quay
+        uses: docker/login-action@v3
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: make test
+
+      - name: Build multi-arch manager binaries
+        run: |
+          make build-multiarch
+          cp Dockerfile bin/release/Dockerfile
+
+      - name: Build and push operator image
+        uses: docker/build-push-action@v6
+        with:
+          context: bin/release
+          file: bin/release/Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.version.outputs.img }}
+
+      - name: Regenerate bundle manifests
+        run: make bundle IMG=${{ steps.version.outputs.img }} VERSION=${{ steps.version.outputs.version }}
+
+      - name: Build and push bundle image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: bundle.Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.version.outputs.bundle_img }}
+
+      - name: Install opm
+        run: make opm
+
+      - name: Build and push catalog image
+        run: |
+          set -euo pipefail
+          FROM_INDEX="${{ steps.version.outputs.from_index }}"
+          FROM_INDEX_OPT=""
+          if [ -n "$FROM_INDEX" ]; then
+            FROM_INDEX_OPT="--from-index $FROM_INDEX"
+          fi
+          # shellcheck disable=SC2086
+          ./bin/opm index add \
+            --container-tool docker \
+            --mode semver \
+            --tag "${{ steps.version.outputs.catalog_img }}" \
+            --bundles "${{ steps.version.outputs.bundle_img }}" \
+            $FROM_INDEX_OPT \
+            --generate \
+            --permissive
+          docker rmi "${{ steps.version.outputs.catalog_img }}" || true
+          docker buildx build \
+            --platform "${{ env.PLATFORMS }}" \
+            -f index.Dockerfile \
+            -t "${{ steps.version.outputs.catalog_img }}" \
+            --push .
+
+      - name: Summary
+        run: |
+          {
+            echo "## Pushed to Quay"
+            echo ""
+            echo "- Operator: \`${{ steps.version.outputs.img }}\` (${{ env.PLATFORMS }})"
+            echo "- Bundle: \`${{ steps.version.outputs.bundle_img }}\` (${{ env.PLATFORMS }})"
+            echo "- Catalog: \`${{ steps.version.outputs.catalog_img }}\` (${{ env.PLATFORMS }})"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -224,6 +224,21 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	$(KUSTOMIZE) build config/default | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
 
+##@ Release
+
+.PHONY: release
+release: ## Tag v$(VERSION) and publish a GitHub release, triggering the Quay release workflow. (E.g. make release VERSION=0.0.8)
+	@command -v gh >/dev/null 2>&1 || { echo "ERROR: gh CLI not found. See https://cli.github.com"; exit 1; }
+	@gh auth status >/dev/null 2>&1 || { echo "ERROR: gh is not authenticated. Run 'gh auth login'."; exit 1; }
+	@test -z "$$(git status --porcelain)" || { echo "ERROR: working tree is dirty. Commit or stash changes first."; exit 1; }
+	@echo "$(VERSION)" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$$' || { echo "ERROR: invalid VERSION '$(VERSION)'. Expected semver like 0.0.8."; exit 1; }
+	@if git rev-parse "v$(VERSION)" >/dev/null 2>&1; then echo "ERROR: tag v$(VERSION) already exists locally."; exit 1; fi
+	@if gh release view "v$(VERSION)" >/dev/null 2>&1; then echo "ERROR: release v$(VERSION) already exists."; exit 1; fi
+	@git tag "v$(VERSION)"
+	@git push origin "v$(VERSION)"
+	@gh release create "v$(VERSION)" --title "v$(VERSION)" --generate-notes
+	@echo "Released v$(VERSION). Watch progress with: gh run list --workflow release.yml"
+
 ##@ Build Dependencies
 
 ## Location to install dependencies to
