@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: quay.io/cldmnky/hyper-ops
-  newTag: 0.0.2
+  newTag: v0.0.7

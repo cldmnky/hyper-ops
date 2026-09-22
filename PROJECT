@@ -4,13 +4,17 @@
 # More info: https://book.kubebuilder.io/reference/project-config.html
 domain: cloudmonkey.org
 layout:
-- go.kubebuilder.io/v3
+- go.kubebuilder.io/v4
 plugins:
   manifests.sdk.operatorframework.io/v2: {}
   scorecard.sdk.operatorframework.io/v2: {}
 projectName: hyper-ops
 repo: github.com/cldmnky/hyper-ops
 resources:
+- controller: true
+  domain: cloudmonkey.org
+  kind: HyperOps
+  version: v1alpha1
 - api:
     crdVersion: v1
     namespaced: true

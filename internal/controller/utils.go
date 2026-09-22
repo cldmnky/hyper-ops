@@ -1,9 +1,10 @@
-package controllers
+package controller
 
 import (
 	"context"
 
 	configv1 "github.com/openshift/api/config/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/retry"
@@ -11,8 +12,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 // CreateOrUpdateWithRetries creates or updates the given object in the Kubernetes with retries

@@ -4,17 +4,22 @@ metadata:
   annotations:
     alm-examples: '[]'
     capabilities: Basic Install
-  name: hyper-ops.v0.0.0
+  name: hyper-ops.v0.0.4
   namespace: placeholder
 spec:
   apiservicedefinitions: {}
-  customresourcedefinitions: {}
-  description: A small controller that creates ArgoCD clusters from hypershift hosted
-    clusters
-  displayName: HyperOps
+  customresourcedefinitions:
+    owned:
+    - description: Config is the Schema for the configs API
+      displayName: Config
+      kind: Config
+      name: configs.hyper-ops.cloudmonkey.org
+      version: v1alpha1
+  description: A controller for creating clusters in ArgoCD from hosted clusters
+  displayName: hyper-ops
   icon:
-  - base64data: ""
-    mediatype: ""
+  - base64data: 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
+    mediatype: image/png
   install:
     spec:
       deployments: null
@@ -30,14 +35,13 @@ spec:
     type: AllNamespaces
   keywords:
   - argocd
+  - gitops
   - hypershift
   links:
   - name: Hyper Ops
-    url: https://hyper-ops.domain
-  maintainers:
-  - email: mbengtss@redhat.com
-    name: name1
+    url: https://github.com/cldmnky/hyper-ops
   maturity: alpha
+  minKubeVersion: 1.25.0
   provider:
-    name: HyperOps
+    name: cldmnky
   version: 0.0.0

@@ -2,7 +2,6 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  creationTimestamp: null
   name: manager-role
 rules:
 - apiGroups:
@@ -30,9 +29,9 @@ rules:
   - update
   - watch
 - apiGroups:
-  - "rbac.authorization.k8s.io"
+  - hyper-ops.cloudmonkey.org
   resources:
-  - clusterrolebindings
+  - configs
   verbs:
   - create
   - delete
@@ -42,17 +41,19 @@ rules:
   - update
   - watch
 - apiGroups:
-  - "rbac.authorization.k8s.io"
+  - hyper-ops.cloudmonkey.org
   resources:
-  - clusterroles
+  - configs/finalizers
   verbs:
-  - create
-  - delete
+  - update
+- apiGroups:
+  - hyper-ops.cloudmonkey.org
+  resources:
+  - configs/status
+  verbs:
   - get
-  - list
   - patch
   - update
-  - watch
 - apiGroups:
   - hypershift.openshift.io
   resources:
