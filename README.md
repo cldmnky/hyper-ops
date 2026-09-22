@@ -122,6 +122,44 @@ kubectl get sa hyper-ops-admin -n kube-system  # management cluster and hosted c
 
 All other `hyper-ops.cloudmonkey.org/*` labels on the `HostedCluster` are copied onto its Argo CD secret.
 
+## hyper-ops vs. Red Hat Advanced Cluster Management (ACM) GitOps
+
+Both projects solve the same core problem: making clusters available as Argo CD deployment
+targets by creating `argocd.argoproj.io/secret-type: cluster` Secrets with credentials.
+They solve it differently and target different environments.
+
+| Concern | hyper-ops | ACM GitOps |
+|---|---|---|
+| Cluster inventory | HyperShift `HostedCluster` objects | ACM-imported `ManagedCluster` objects |
+| Target selection | Opt-in label (`hyper-ops.cloudmonkey.org/enabled`) | `ManagedClusterSet` + `Placement` + `GitOpsCluster` |
+| Registration API | Implicit: labeling a `HostedCluster` triggers reconciliation | Explicit `GitOpsCluster` CR linking a `Placement` to an Argo CD server/namespace |
+| Credentials | Creates a `cluster-admin` service account and persistent token per cluster | Rotating `ManagedServiceAccount` tokens, cluster-proxy support, customizable permissions |
+| Deployment model | Push only: central Argo CD talks directly to each hosted cluster API | Push and pull (pull replicates `Application`s via `ManifestWork` for restricted networks) |
+| GitOps lifecycle | Assumes Argo CD / OpenShift GitOps already exists | Can deploy and manage the GitOps add-on, agents, certificates, and CA propagation |
+
+### Use hyper-ops when
+
+- The environment is HyperShift-focused and ACM is not installed or not wanted.
+- The management-cluster Argo CD server can reach every hosted cluster API endpoint directly.
+- A lightweight, label-driven opt-in per `HostedCluster` is sufficient.
+- Granting the provisioned `hyper-ops-admin` account `cluster-admin` is acceptable.
+
+### Use ACM GitOps when
+
+- ACM is already the multicluster management plane.
+- Cluster targeting should be declarative and governed (`ManagedClusterSet`, bindings, `Placement`).
+- Credential rotation, least-privilege service accounts, or cluster-proxy connectivity matter.
+- Targets are hard to reach from the hub and need pull-mode GitOps.
+- You need `ApplicationSet` placement, status aggregation, policy integration, or console support.
+
+Do not let both systems register the same cluster into the same Argo CD instance: they
+reconcile the same Secret type and will compete over credentials, endpoints, labels, and
+deletion. Keep their cluster sets (or Argo CD namespaces) disjoint.
+
+See the
+[ACM GitOps documentation](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.16/html/gitops/gitops-overview)
+for the native `GitOpsCluster` + `Placement` flow.
+
 ## Notes and limitations
 
 - The bundled `Config` CRD (`configs.hyper-ops.cloudmonkey.org`) is currently a placeholder with no controller behavior; enrollment is driven entirely by `HostedCluster` labels.
