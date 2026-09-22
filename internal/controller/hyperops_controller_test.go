@@ -21,7 +21,10 @@ import (
 
 var _ = Describe("Hyper-Ops controller", func() {
 	Context("hyper-ops controller test", func() {
-		const hyperOpsControllerBaseName = "test-hyperops"
+		const (
+			hyperOpsControllerBaseName = "test-hyperops"
+			gitOpsNamespaceBaseName    = "openshift-gitops"
+		)
 		var (
 			typeNamespaceName           = types.NamespacedName{}
 			hyperOpsControllerNameSpace string
@@ -46,21 +49,22 @@ var _ = Describe("Hyper-Ops controller", func() {
 			}
 			err := k8sClient.Create(ctx, namespace)
 			Expect(err).To(Not(HaveOccurred()))
+			gitOpsNamespaceName := fmt.Sprintf("%s-%d", gitOpsNamespaceBaseName, time.Now().UnixMilli())
 			gitOpsNamespace = &corev1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      fmt.Sprintf("openshift-gitops-%d", time.Now().UnixMilli()),
-					Namespace: fmt.Sprintf("openshift-gitops-%d", time.Now().UnixMilli()),
+					Name:      gitOpsNamespaceName,
+					Namespace: gitOpsNamespaceName,
 				},
 			}
 			err = k8sClient.Create(ctx, gitOpsNamespace)
 			Expect(err).To(Not(HaveOccurred()))
 			// create the openshift-gitops namespace if it does not exist
-			err = k8sClient.Get(ctx, types.NamespacedName{Name: "openshift-gitops", Namespace: "openshift-gitops"}, defaultGitOpsNamespace)
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: gitOpsNamespaceBaseName, Namespace: gitOpsNamespaceBaseName}, defaultGitOpsNamespace)
 			if err != nil {
 				defaultGitOpsNamespace = &corev1.Namespace{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "openshift-gitops",
-						Namespace: "openshift-gitops",
+						Name:      gitOpsNamespaceBaseName,
+						Namespace: gitOpsNamespaceBaseName,
 					},
 				}
 				err = k8sClient.Create(ctx, defaultGitOpsNamespace)
@@ -80,11 +84,21 @@ var _ = Describe("Hyper-Ops controller", func() {
 					Namespace: hyperOpsControllerNameSpace,
 				},
 				Spec: hypershiftv1beta1.HostedClusterSpec{
+					// The current HostedCluster API requires a pull secret reference,
+					// managed etcd storage and the full set of published services.
+					PullSecret: corev1.LocalObjectReference{
+						Name: "pull-secret",
+					},
 					Release: hypershiftv1beta1.Release{
 						Image: "quay.io/openshift-release-dev/ocp-release:4.8.0-fc.0-x86_64",
 					},
 					Etcd: hypershiftv1beta1.EtcdSpec{
 						ManagementType: hypershiftv1beta1.Managed,
+						Managed: &hypershiftv1beta1.ManagedEtcdSpec{
+							Storage: hypershiftv1beta1.ManagedEtcdStorageSpec{
+								Type: hypershiftv1beta1.PersistentVolumeEtcdStorage,
+							},
+						},
 					},
 					Networking: hypershiftv1beta1.ClusterNetworking{
 						NetworkType: hypershiftv1beta1.OVNKubernetes,
@@ -99,9 +113,27 @@ var _ = Describe("Hyper-Ops controller", func() {
 					},
 					Services: []hypershiftv1beta1.ServicePublishingStrategyMapping{
 						{
-							Service: hypershiftv1beta1.ServiceType(hypershiftv1beta1.APIServer),
+							Service: hypershiftv1beta1.APIServer,
 							ServicePublishingStrategy: hypershiftv1beta1.ServicePublishingStrategy{
 								Type: hypershiftv1beta1.LoadBalancer,
+							},
+						},
+						{
+							Service: hypershiftv1beta1.OAuthServer,
+							ServicePublishingStrategy: hypershiftv1beta1.ServicePublishingStrategy{
+								Type: hypershiftv1beta1.Route,
+							},
+						},
+						{
+							Service: hypershiftv1beta1.Konnectivity,
+							ServicePublishingStrategy: hypershiftv1beta1.ServicePublishingStrategy{
+								Type: hypershiftv1beta1.Route,
+							},
+						},
+						{
+							Service: hypershiftv1beta1.Ignition,
+							ServicePublishingStrategy: hypershiftv1beta1.ServicePublishingStrategy{
+								Type: hypershiftv1beta1.Route,
 							},
 						},
 					},
